@@ -78,10 +78,9 @@ class NetBody25(nn.Module):
         return root_orient, body_pose, hand_pose
 
 
-    def forward(self, x, is_training=True):
+    def forward(self, x, is_training=True, end_joints_override=None):
         info_dict = {}
         start_root_orient, start_body_pose, start_hand_pose = self.split_pose_from_smplh(x['start_pose'])
-        end_root_orient, end_body_pose, end_hand_pose = self.split_pose_from_smplh(x['end_pose'])
         betas = x['betas'][:, :10]
 
         start_smpl = self.human_model.layer['neutral'](
@@ -90,21 +89,25 @@ class NetBody25(nn.Module):
             body_pose=start_body_pose
         )
 
-        end_smpl = self.human_model.layer['neutral'](
-            betas=betas,
-            global_orient=end_root_orient,
-            body_pose=end_body_pose
-        )
-
         # NOTE(yyc): use openpose 25 joints
         start_joints = torch.einsum('bvc,jv->bjc', start_smpl.vertices, self.openpose_regressor)
-        end_joints = torch.einsum('bvc,jv->bjc', end_smpl.vertices, self.openpose_regressor)
+
+        if end_joints_override is not None:
+            # Use pre-computed OpenPose 25 joints directly (skip SMPL forward for end frame)
+            end_joints = end_joints_override
+        else:
+            end_root_orient, end_body_pose, end_hand_pose = self.split_pose_from_smplh(x['end_pose'])
+            end_smpl = self.human_model.layer['neutral'](
+                betas=betas,
+                global_orient=end_root_orient,
+                body_pose=end_body_pose
+            )
+            end_joints = torch.einsum('bvc,jv->bjc', end_smpl.vertices, self.openpose_regressor)
 
         # For vis
         info_dict['start_joints'] = start_joints[0].clone() if is_training else start_joints.clone()
         info_dict['end_joints'] = end_joints[0].clone() if is_training else end_joints.clone()
         info_dict['start_verts'] = start_smpl.vertices[0].clone() if is_training else start_smpl.vertices.clone()
-        info_dict['end_verts'] = end_smpl.vertices[0].clone() if is_training else end_smpl.vertices.clone()
 
         # add translation
         start_joints = start_joints + x['start_trans'].unsqueeze(1)
@@ -119,18 +122,20 @@ class NetBody25(nn.Module):
         input_joints = input_joints.permute(0, 3, 1, 2) # N, T, V, C -> N, C, T, V
 
         # -- network process --
-        if not is_training:
+        use_cuda_timing = not is_training and x['start_pose'].is_cuda
+        if use_cuda_timing:
             start_time = torch.cuda.Event(enable_timing=True)
             end_time = torch.cuda.Event(enable_timing=True)
             start_time.record()
         pred_smpl, pred_joints, pred_rotmat_wo_hands, pred_body_pose, pred_root_orient = self.predict(input_joints, start_root_orient, start_body_pose, betas)
 
         if not is_training:
-            end_time.record()
-            torch.cuda.synchronize()
             info_dict['pred_body_pose'] = pred_body_pose
             info_dict['pred_root_orient'] = pred_root_orient
-            info_dict['infer_time'] = start_time.elapsed_time(end_time) / 1000.0  # in seconds
+            if use_cuda_timing:
+                end_time.record()
+                torch.cuda.synchronize()
+                info_dict['infer_time'] = start_time.elapsed_time(end_time) / 1000.0  # in seconds
 
         info_dict['pred_verts'] = pred_smpl.vertices[0].clone() if is_training else pred_smpl.vertices.clone()
         info_dict['pred_joints'] = pred_joints[0].clone() if is_training else pred_joints.clone()
@@ -138,21 +143,23 @@ class NetBody25(nn.Module):
         # -- loss --
         loss_dict = {}
 
-        pred_joints = pred_joints + x['end_trans'].unsqueeze(1)
-        pred_joints, _, _ = normalize_kp(pred_joints, invalid_mask, self.kp_index, R=R, T=T)
+        if end_joints_override is None:
+            # Loss computation requires end SMPL params (only available during training)
+            pred_joints = pred_joints + x['end_trans'].unsqueeze(1)
+            pred_joints, _, _ = normalize_kp(pred_joints, invalid_mask, self.kp_index, R=R, T=T)
 
-        B = pred_joints.shape[0]
-        end_rotmat_wo_hands = batch_rodrigues(torch.cat([end_root_orient, end_body_pose[:, :-2]], dim=1).view(-1, 3)).view(B, -1, 3, 3)
+            B = pred_joints.shape[0]
+            end_rotmat_wo_hands = batch_rodrigues(torch.cat([end_root_orient, end_body_pose[:, :-2]], dim=1).view(-1, 3)).view(B, -1, 3, 3)
 
-        if 'pose' in self.config.loss_config:
-            loss_dict['smpl_pose'] = self.param_loss(pred_rotmat_wo_hands, end_rotmat_wo_hands).mean()
-            loss_dict['smpl_pose'] = loss_dict['smpl_pose'] * self.config.loss_config['pose']
-        if 'verts' in self.config.loss_config:
-            loss_dict['smpl_verts'] = self.param_l2_loss(pred_smpl.vertices, end_smpl.vertices).mean()
-            loss_dict['smpl_verts'] = loss_dict['smpl_verts'] * self.config.loss_config['verts']
-        if 'kp3d' in self.config.loss_config:
-            loss_dict['smpl_kp3d'] = self.param_l2_loss(pred_joints, end_joints).mean()
-            loss_dict['smpl_kp3d'] = loss_dict['smpl_kp3d'] * self.config.loss_config['kp3d']
+            if 'pose' in self.config.loss_config:
+                loss_dict['smpl_pose'] = self.param_loss(pred_rotmat_wo_hands, end_rotmat_wo_hands).mean()
+                loss_dict['smpl_pose'] = loss_dict['smpl_pose'] * self.config.loss_config['pose']
+            if 'verts' in self.config.loss_config:
+                loss_dict['smpl_verts'] = self.param_l2_loss(pred_smpl.vertices, end_smpl.vertices).mean()
+                loss_dict['smpl_verts'] = loss_dict['smpl_verts'] * self.config.loss_config['verts']
+            if 'kp3d' in self.config.loss_config:
+                loss_dict['smpl_kp3d'] = self.param_l2_loss(pred_joints, end_joints).mean()
+                loss_dict['smpl_kp3d'] = loss_dict['smpl_kp3d'] * self.config.loss_config['kp3d']
 
         return loss_dict, info_dict
 
